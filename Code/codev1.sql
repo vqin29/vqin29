@@ -299,18 +299,261 @@ WITH p AS
       FROM with_rn_csv
       WHERE "row_number" = 1
      )
+ ,gads AS 
+    (SELECT
+        fk."er_id"
+        ,gad."segmentsDate"::date AS "date"
+        ,CASE WHEN gad."campaignAdvertisingChannelType" = 'SEARCH' THEN 'Google Ads'
+              ELSE initcap(gad."campaignAdvertisingChannelType")
+              END AS "internal_channel"
+        ,gad."campaignName" AS "campaign"
+        ,gad."campaignId"::string AS "campaign_id"
+        ,sum(gad."metricsClicks") AS "sessions_clicks"
+        ,sum(gad."metricsCostMicros") / 750000 as "cost"  -- accounts for 75% margin and microns adjustment
+      FROM (SELECT * FROM "gad_campaign_performance_final" UNION ALL SELECT * FROM "gad_campaign_performance_window") gad
+      INNER JOIN "er_fk_table" fk
+        ON gad."customerId" = fk."aw_id"
+      WHERE gad."campaignAdvertisingChannelType" in ('DISPLAY','SEARCH','SHOPPING') 
+      GROUP BY 1,2,3,4,5   
+     )
+ ,fb AS 
+    (SELECT fk."er_id"
+           ,fa."date_start" as "date"
+           ,'Facebook Ads' as "internal_channel"
+           ,fa."campaign_name" as "campaign"
+           ,fa."campaign_id"::string as "campaign_id"
+           ,mode("clicks") as "sessions_clicks" -- uses mode because the data sometimes has anomolies
+           ,mode("spend") / 0.75 as "cost" -- uses mode because the data sometimes has anomolies, accounts for 75% margin
+      from (SELECT * from "fa_campaign_insights_final" UNION ALL select * from "fa_campaign_insights_window") fa
+      inner join "er_fk_table" fk
+      on replace(fa."ex_account_id",'act_','') = fk."fa_ppc_id"
+      group by 1,2,3,4,5 
+    )
+    
+ ,linkedin AS 
+   (SELECT fk."er_id"
+          ,date_from_parts(b."start_year",b."start_month",b."start_day") as "date"
+          ,'LinkedIn' as "internal_channel"
+          ,ca."name" as "campaign"
+          ,ca."id"::string as "campaign_id"
+          ,sum(b."clicks") as "sessions_clicks"
+          ,sum(c."costInLocalCurrency") / 0.75 as "cost"  -- accounts for 75% margin
+      from (SELECT * FROM "li_ads_basic_stats_final" UNION ALL select * FROM "li_ads_basic_stats_window") b
 
-SELECT "er_id"
+      left outer join "li_campaigns" ca
+        on regexp_replace(b."pivotValue",'\\D','') = ca."id"
+
+      left outer join "li_ads_cost_final" c
+        on b."pivotValue" = c."pivotValue"
+        and b."start_year" = c."start_year"
+        and b."start_month" = c."start_month"
+        and b."start_day" = c."start_day"
+
+      inner join "er_fk_table" fk
+       on regexp_replace(ca."account",'\\D','') = fk."li_id"
+      group by 1,2,3,4,5   
+   )
+ ,seo as 
+ ( select ga_cc."er_id"
+      ,ga_cc."date"
+      ,ga_cc."internal_channel" as "internal_channel"
+      ,ga_cc."internal_channel" as "campaign"
+      ,ga_cc."internal_channel" as "campaign_id"
+      ,ga_cc."sessions_clicks"
+      ,ga_cc."cost"
+    from
+    (
+      -- Google Analytics sessions and cost
+      -- organic, Direct, Email and Other sessions are always sourced with this table
+      -- Google Ads, Display, Facebook Ads and Linkendin sessions are only sourced from GA when there is no integration added for that client
+
+      select
+        ga."er_id"
+        ,ga."date"
+        ,ga."internal_channel" as "internal_channel"
+        ,ga."sessions_clicks"
+        ,iv."total_no_tax"
+        ,gas."days_in_month"
+        ,iv."total_no_tax" / gas."days_in_month" as "cost" -- averages out monthly invoices
+      from
+      (
+        select
+          fk."er_id"
+          ,to_date (left(ga."dateHourMinute",8),'YYYYMMDD') as "date"
+          -- make sure this matches https://www.notion.so/erdocs/How-we-define-an-internal-channel-867892a4e1fc412ba62ec59c2cfc9d2c
+          ,case when ga."medium" = 'organic' then 'SEO'    -- claims all organic
+                when (contains(lower(ga."source"),'facebook')
+                      or lower(ga."source") = 'social')
+                  and lower(ga."medium") in ('cpc','ppc')
+                  then 'Facebook Ads'  -- claims all social cpc traffic
+                when contains(lower(ga."source"),'linkedin')
+                  and lower(ga."medium") in ('cpc','ppc')
+                  then 'LinkedIn'
+                when contains(lower(ga."source"),'facebook')
+                  or contains(lower(ga."source"),'instagram')
+                  or contains(lower(ga."source"),'linkedin')
+                  or contains(lower(ga."source"),'lnkd.in')
+                  or lower(ga."source") = 'social'
+                  or lower(ga."medium") = 'social'
+                  then 'Social'
+                when lower(ga."source") = 'google'
+                  and rlike(ga."medium",'^(cpc|ppc)$')
+                  and ga."adDistributionNetwork" != 'Content'
+                  then 'Google Ads'
+                when ga."source" = '(direct)'
+                  and ga."medium" in ('(not set)','(none)')
+                  then 'Direct'
+                when rlike(ga."medium",'^(display|cpm|banner)$')
+                  or ga."adDistributionNetwork" = 'Content'
+                  then 'Display'
+                when ga."medium" = 'email' then 'Email'
+                else 'Other'
+                end as "internal_channel"
+          ,sum(ga."sessions") as "sessions_clicks"
+        from "ga_sessions" ga
+
+        inner join "er_fk_table" fk
+        on ga."idProfile" = fk."ga_id"
+
+        group by 1,2,3
+      ) ga
+
+
+      inner join "er_fk_table" fk
+      on ga."er_id" = fk."er_id"
+
+
+      -- spend data for SEO from EngineRoom's Xero invoices
+
+      left outer join
+      (
+        select
+          fk."er_id"
+          ,date_trunc('month',i."Date") as "month"
+          ,sum(i."TotalAmount") as "total_no_tax"
+        from "acc_invoices" i
+
+        inner join "er_fk_table" fk
+        on contains(fk."xero_contact_id",i."ContactID")
+
+        where i."uid" = '8803f645-f822-46a2-a3d8-5834cfa27ca5'
+        and i."ProductCode" in ('I-DM021','I-DM013','I-DM020','I-DM022','I-DM014','I-DM014.1')  -- seo solutions and net-dev
+        and i."Status" in ('PAID','AUTHORISED')
+
+        group by 1,2
+      ) iv
+
+      on ga."er_id" = iv."er_id"
+      and date_trunc(month,ga."date") = iv."month"
+      and ga."internal_channel" = 'SEO'
+
+
+      -- in case there are days without activity to make the total cost add up for the month
+
+      left outer join
+      (
+        select
+          fk."er_id"
+          ,date_trunc(month,to_date (left(ga."dateHourMinute",8),'YYYYMMDD')) as "month"
+          ,count(distinct to_date (left(ga."dateHourMinute",8),'YYYYMMDD')) as "days_in_month"
+        from "ga_sessions" ga
+
+        inner join "er_fk_table" fk
+        on ga."idProfile" = fk."ga_id"
+
+        where ga."medium" = 'organic'   -- only need days with SEO activity
+
+        group by 1,2
+      ) gas
+
+        on ga."er_id" = gas."er_id"
+        and date_trunc(month,ga."date") = gas."month"
+        and ga."internal_channel" = 'SEO'
+
+        where not (ga."internal_channel" in ('Google Ads','Display') and fk."aw_id" is not null)    -- ensures there is no data if there is a google ads integration
+        and not (ga."internal_channel" = 'Facebook Ads' and fk."fa_ppc_id" is not null)   -- ensures there is no data if there is a facebook ads integration
+        and not (ga."internal_channel" = 'LinkedIn' and fk."li_id" is not null)    -- ensures there is no data if there is a linkedin integration
+
+        group by 1,2,3,4,5,6,7
+    ) ga_cc
+ )
+ ,stacked_costs as 
+   (SELECT * FROM gads
+    UNION ALL 
+    SELECT * FROM fb 
+    UNION ALL 
+    SELECT * FROM linkedin 
+    UNION ALL 
+    SELECT * FROM seo)
+ ,stacked_costs_grouped as 
+   (SELECT "er_id"
+           ,"internal_channel"
+           ,DATE_TRUNC('month',to_timestamp("date")) as "month_date"
+           ,sum("cost") as "cost" 
+    FROM stacked_costs
+    GROUP BY 1,2,3)
+  ,lasttouch AS 
+                (select ROW_NUMBER() OVER (PARTITION BY "google_client_id" ORDER BY "start_time" desc) as rn
+                 ,"google_client_id"
+                 ,"start_time"
+                 ,case when "medium" = 'organic' then 'SEO'    -- claims all organic
+                       when (contains(lower("source"),'facebook') or lower("source") = 'social') and lower("medium") in ('cpc','ppc')
+                            then 'Facebook Ads'  -- claims all social cpc traffic
+                       when contains(lower("source"),'linkedin') and lower("medium") in ('cpc','ppc')
+                            then 'LinkedIn'
+                       when contains(lower("source"),'facebook') or contains(lower("source"),'instagram') or contains(lower("source"),'linkedin')
+                            or contains(lower("source"),'lnkd.in') or lower("source") = 'social'or lower("medium") = 'social'
+                            then 'Social'
+                       when lower("source") = 'google' and contains("channel",'Paid Search')
+                            then 'Google Ads'
+                       when "channel" in ('Direct','Display') then "channel"
+                       when "medium" = 'email' then 'Email'
+                       else 'Other'
+                  end as channel
+                 ,case when "medium" = 'organic' then 'SEO'    -- claims all organic
+                       when (contains(lower("source"),'facebook') or lower("source") = 'social') and lower("medium") in ('cpc','ppc')
+                            then 'Facebook Ads'  -- claims all social cpc traffic
+                       when contains(lower("source"),'linkedin') and lower("medium") in ('cpc','ppc')
+                            then 'LinkedIn'
+                       when contains(lower("source"),'facebook') or contains(lower("source"),'instagram') or contains(lower("source"),'linkedin')
+                            or contains(lower("source"),'lnkd.in') or lower("source") = 'social'or lower("medium") = 'social'
+                            then 'LinkedIn'
+                       when lower("source") = 'google' and contains("channel",'Paid Search')
+                            then 'Google Ads'
+                       when "channel" in ('Direct') then 'Direct'
+                       else 'Other'
+                  end as "LastTouch"
+                 from "er_ga_sessions"
+                 ) 
+  ,base as (SELECT "er_id","googleClientId","attribution_method","Revenue",DATE_TRUNC('month',to_timestamp("timestamp")) as "month_timestamp" FROM B 
+            UNION ALL 
+            SELECT "er_id","googleClientId","attribution_method","Revenue",DATE_TRUNC('month',to_timestamp("timestamp")) as "month_timestamp" FROM B_CSV
+           )
+  ,base_joined as (SELECT base.*
+                         ,x."LastTouch" --this maps out the last touch attribution to either Google Ads // LinkedIn // FB // SEO // Direct for each lead
+                   FROM base 
+                   LEFT JOIN lasttouch x 
+                     on base."googleClientId" = x."google_client_id"
+                     and rn=1
+                   )
+
+SELECT base_joined."er_id"
+      ,"LastTouch"
       ,"attribution_method"
-//      ,DATE_TRUNC('month',to_timestamp("timestamp"))
       ,sum("Revenue") as "Revenue"
       ,count(*) as "Rows"
-      ,count(distinct "er_id") as "Distinct_Businesses"
+      ,"cost"
+      ,sum("Revenue")/"cost" as "ROI"
+      ,count(distinct base_joined."er_id") as "Distinct_Businesses"
       ,count(distinct "googleClientId") as "Distinct_Customers"   
-FROM (SELECT "er_id","googleClientId","attribution_method","Revenue","timestamp" FROM B UNION ALL SELECT "er_id","googleClientId","attribution_method","Revenue","timestamp" FROM B_CSV)
-GROUP BY 1,2
-ORDER BY 1,2
- 
-  
+FROM base_joined 
+       
+LEFT JOIN stacked_costs_grouped
+    on base_joined."er_id" = stacked_costs_grouped."er_id"
+    and base_joined."month_timestamp" = stacked_costs_grouped."month_date"
+    and base_joined."LastTouch" = stacked_costs_grouped."internal_channel" 
 
-                  
+WHERE "month_timestamp" = '2022-06-01'
+  
+GROUP BY 1,2,3,6
+ORDER BY 1         
